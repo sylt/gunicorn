@@ -230,6 +230,10 @@ class Arbiter(object):
         self.reap_workers()
         self.enqueue_signal(None)
 
+        # Some UNIXes require SIGCHLD to be reinstalled, see python signal docs
+        if sig == signal.SIGCHLD:
+            signal.signal(sig, self.signal)
+
     def handle_hup(self):
         """\
         HUP handling.
