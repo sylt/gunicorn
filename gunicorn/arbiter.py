@@ -5,11 +5,11 @@
 import errno
 import os
 import random
-import select
 import signal
 import sys
 import time
 import traceback
+import queue
 
 from gunicorn.errors import HaltServer, AppImportError
 from gunicorn.pidfile import Pidfile
@@ -37,10 +37,9 @@ class Arbiter(object):
 
     LISTENERS = []
     WORKERS = {}
-    PIPE = []
+    SIG_QUEUE = queue.SimpleQueue()
 
     # I love dynamic languages
-    SIG_QUEUE = []
     SIGNALS = [getattr(signal, "SIG%s" % x)
                for x in "HUP QUIT INT TERM TTIN TTOU USR1 USR2 WINCH".split()]
     SIG_NAMES = dict(
@@ -171,16 +170,6 @@ class Arbiter(object):
         Initialize master signal handling. Most of the signals
         are queued. Child signals only wake up the master.
         """
-        # close old PIPE
-        for p in self.PIPE:
-            os.close(p)
-
-        # initialize the pipe
-        self.PIPE = pair = os.pipe()
-        for p in pair:
-            util.set_non_blocking(p)
-            util.close_on_exec(p)
-
         self.log.close_on_exec()
 
         # initialize all signals
@@ -189,9 +178,8 @@ class Arbiter(object):
         signal.signal(signal.SIGCHLD, self.handle_chld)
 
     def signal(self, sig, frame):
-        if len(self.SIG_QUEUE) < 5:
-            self.SIG_QUEUE.append(sig)
-            self.wakeup()
+        if self.SIG_QUEUE.qsize() < 5:
+            self.SIG_QUEUE.put(sig)
 
     def run(self):
         "Main master loop."
@@ -204,25 +192,22 @@ class Arbiter(object):
             while True:
                 self.maybe_promote_master()
 
-                sig = self.SIG_QUEUE.pop(0) if self.SIG_QUEUE else None
-                if sig is None:
-                    self.sleep()
-                    self.murder_workers()
-                    self.manage_workers()
-                    continue
+                try:
+                    sig = self.SIG_QUEUE.get(timeout=1)
+                except queue.Empty:
+                    sig = None
 
-                if sig not in self.SIG_NAMES:
-                    self.log.info("Ignoring unknown signal: %s", sig)
-                    continue
+                if sig:
+                    signame = self.SIG_NAMES.get(sig)
+                    handler = getattr(self, "handle_%s" % signame, None)
+                    if not handler:
+                        self.log.error("Unhandled signal: %s", signame)
+                        continue
+                    self.log.info("Handling signal: %s", signame)
+                    handler()
 
-                signame = self.SIG_NAMES.get(sig)
-                handler = getattr(self, "handle_%s" % signame, None)
-                if not handler:
-                    self.log.error("Unhandled signal: %s", signame)
-                    continue
-                self.log.info("Handling signal: %s", signame)
-                handler()
-                self.wakeup()
+                self.murder_workers()
+                self.manage_workers()
         except (StopIteration, KeyboardInterrupt):
             self.halt()
         except HaltServer as inst:
@@ -240,7 +225,6 @@ class Arbiter(object):
     def handle_chld(self, sig, frame):
         "SIGCHLD handling"
         self.reap_workers()
-        self.wakeup()
 
     def handle_hup(self):
         """\
@@ -327,16 +311,6 @@ class Arbiter(object):
             # reset proctitle
             util._setproctitle("master [%s]" % self.proc_name)
 
-    def wakeup(self):
-        """\
-        Wake up the arbiter by writing to the PIPE
-        """
-        try:
-            os.write(self.PIPE[1], b'.')
-        except IOError as e:
-            if e.errno not in [errno.EAGAIN, errno.EINTR]:
-                raise
-
     def halt(self, reason=None, exit_status=0):
         """ halt arbiter """
         self.stop()
@@ -350,25 +324,6 @@ class Arbiter(object):
             self.pidfile.unlink()
         self.cfg.on_exit(self)
         sys.exit(exit_status)
-
-    def sleep(self):
-        """\
-        Sleep until PIPE is readable or we timeout.
-        A readable PIPE means a signal occurred.
-        """
-        try:
-            ready = select.select([self.PIPE[0]], [], [], 1.0)
-            if not ready[0]:
-                return
-            while os.read(self.PIPE[0], 1):
-                pass
-        except (select.error, OSError) as e:
-            # TODO: select.error is a subclass of OSError since Python 3.3.
-            error_number = getattr(e, 'errno', e.args[0])
-            if error_number not in [errno.EAGAIN, errno.EINTR]:
-                raise
-        except KeyboardInterrupt:
-            sys.exit()
 
     def stop(self, graceful=True):
         """\
