@@ -177,9 +177,12 @@ class Arbiter(object):
             signal.signal(s, self.signal)
         signal.signal(signal.SIGCHLD, self.handle_chld)
 
-    def signal(self, sig, frame):
+    def enqueue_signal(self, signal_or_none_to_wakeup):
         if self.SIG_QUEUE.qsize() < 5:
-            self.SIG_QUEUE.put(sig)
+            self.SIG_QUEUE.put(signal_or_none_to_wakeup)
+
+    def signal(self, sig, frame):
+        self.enqueue_signal(sig)
 
     def run(self):
         "Main master loop."
@@ -225,6 +228,7 @@ class Arbiter(object):
     def handle_chld(self, sig, frame):
         "SIGCHLD handling"
         self.reap_workers()
+        self.enqueue_signal(None)
 
     def handle_hup(self):
         """\
@@ -348,6 +352,8 @@ class Arbiter(object):
         self.kill_workers(sig)
         # wait until the graceful timeout
         while self.WORKERS and time.time() < limit:
+            for wpid in list(self.WORKERS.keys()):
+                self.remove_worker_with_pid_if_dead(wpid)
             time.sleep(0.1)
 
         self.kill_workers(signal.SIGKILL)
@@ -473,55 +479,74 @@ class Arbiter(object):
                     break
                 if self.reexec_pid == wpid:
                     self.reexec_pid = 0
-                else:
-                    # A worker was terminated. If the termination reason was
-                    # that it could not boot, we'll shut it down to avoid
-                    # infinite start/stop cycles.
-                    exitcode = status >> 8
-                    if exitcode != 0:
-                        self.log.error('Worker (pid:%s) exited with code %s', wpid, exitcode)
-                    if exitcode == self.WORKER_BOOT_ERROR:
-                        reason = "Worker failed to boot."
-                        raise HaltServer(reason, self.WORKER_BOOT_ERROR)
-                    if exitcode == self.APP_LOAD_ERROR:
-                        reason = "App failed to load."
-                        raise HaltServer(reason, self.APP_LOAD_ERROR)
+                    continue
 
-                    if exitcode > 0:
-                        # If the exit code of the worker is greater than 0,
-                        # let the user know.
-                        self.log.error("Worker (pid:%s) exited with code %s.",
-                                       wpid, exitcode)
-                    elif status > 0:
-                        # If the exit code of the worker is 0 and the status
-                        # is greater than 0, then it was most likely killed
-                        # via a signal.
-                        try:
-                            sig_name = signal.Signals(status).name
-                        except ValueError:
-                            sig_name = "code {}".format(status)
-                        msg = "Worker (pid:{}) was sent {}!".format(
-                            wpid, sig_name)
+                worker = self.WORKERS[wpid] if wpid in self.WORKERS else None
+                if not worker:
+                    continue
 
-                        # Additional hint for SIGKILL
-                        if status == signal.SIGKILL:
-                            msg += " Perhaps out of memory?"
-                        self.log.error(msg)
-
-                    worker = self.WORKERS.pop(wpid, None)
-                    if not worker:
-                        continue
-                    worker.tmp.close()
-                    self.cfg.child_exit(self, worker)
+                # A worker is terminated -- register it for later handling.
+                worker.exit_status = status
         except OSError as e:
             if e.errno != errno.ECHILD:
                 raise
+
+    def remove_worker_with_pid_if_dead(self, wpid):
+        if wpid not in self.WORKERS or self.WORKERS[wpid].exit_status is None:
+            return
+
+        worker = self.WORKERS.pop(wpid)
+        if not worker:
+            return
+
+        status = worker.exit_status
+
+        # A worker was terminated. If the termination reason was
+        # that it could not boot, we'll shut it down to avoid
+        # infinite start/stop cycles.
+        exitcode = status >> 8
+        if exitcode != 0:
+            self.log.error('Worker (pid:%s) exited with code %s', wpid, exitcode)
+        if exitcode == self.WORKER_BOOT_ERROR:
+            reason = "Worker failed to boot."
+            raise HaltServer(reason, self.WORKER_BOOT_ERROR)
+        if exitcode == self.APP_LOAD_ERROR:
+            reason = "App failed to load."
+            raise HaltServer(reason, self.APP_LOAD_ERROR)
+
+        if exitcode > 0:
+            # If the exit code of the worker is greater than 0,
+            # let the user know.
+            self.log.error("Worker (pid:%s) exited with code %s.",
+                           wpid, exitcode)
+        elif status > 0:
+            # If the exit code of the worker is 0 and the status
+            # is greater than 0, then it was most likely killed
+            # via a signal.
+            try:
+                sig_name = signal.Signals(status).name
+            except ValueError:
+                sig_name = "code {}".format(status)
+            msg = "Worker (pid:{}) was sent {}!".format(
+                wpid, sig_name)
+
+            # Additional hint for SIGKILL
+            if status == signal.SIGKILL:
+                msg += " Perhaps out of memory?"
+            self.log.error(msg)
+
+        worker.tmp.close()
+        self.cfg.child_exit(self, worker)
 
     def manage_workers(self):
         """\
         Maintain the number of workers by spawning or killing
         as required.
         """
+
+        for wpid in list(self.WORKERS.keys()):
+            self.remove_worker_with_pid_if_dead(wpid)
+
         if len(self.WORKERS) < self.num_workers:
             self.spawn_workers()
 

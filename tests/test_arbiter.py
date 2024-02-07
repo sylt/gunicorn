@@ -144,6 +144,7 @@ def test_arbiter_reap_workers(mock_os_waitpid):
     mock_worker = mock.Mock()
     arbiter.WORKERS = {42: mock_worker}
     arbiter.reap_workers()
+    arbiter.remove_worker_with_pid_if_dead(42)
     mock_worker.tmp.close.assert_called_with()
     arbiter.cfg.child_exit.assert_called_with(arbiter, mock_worker)
 
