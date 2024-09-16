@@ -49,8 +49,8 @@ class Worker:
         self.timeout = timeout
         self.cfg = cfg
         self.booted = False
-        self.aborted = False
         self.reloader = None
+        self.termination_deadline = None
 
         self.nr = 0
 
