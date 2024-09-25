@@ -276,10 +276,11 @@ class Arbiter:
     def handle_usr1(self):
         """\
         SIGUSR1 handling.
-        Kill all workers by sending them a SIGUSR1
+        Re-open log files and propagate signal/re-open request to workers
         """
         self.log.reopen_files()
-        self.kill_workers(signal.SIGUSR1)
+        for worker_pid in self.WORKERS.keys():
+            self.send_signal_to_pid(worker_pid, signal.SIGUSR1)
 
     def handle_usr2(self):
         """\
@@ -345,14 +346,13 @@ class Arbiter:
         sock.close_sockets(self.LISTENERS, unlink)
 
         self.LISTENERS = []
-        sig = signal.SIGTERM
-        if not graceful:
-            sig = signal.SIGQUIT
-        limit = time.time() + self.cfg.graceful_timeout
-        # instruct the workers to exit
+
+        sig = signal.SIGTERM if graceful else signal.SIGQUIT
         self.kill_workers(sig)
+
         # wait until the graceful timeout
-        while self.WORKERS and time.time() < limit:
+        limit = time.monotonic() + self.cfg.graceful_timeout
+        while self.WORKERS and time.monotonic() < limit:
             time.sleep(0.1)
             self.reap_workers()
 
@@ -449,24 +449,21 @@ class Arbiter:
 
     def murder_workers(self):
         """\
-        Kill unused/idle workers
+        Kill workers that seem non-responsive
         """
         if not self.timeout:
             return
-        workers = list(self.WORKERS.items())
-        for (pid, worker) in workers:
+
+        for worker in self.WORKERS.values():
             try:
                 if time.monotonic() - worker.tmp.last_update() <= self.timeout:
                     continue
             except (OSError, ValueError):
                 continue
 
-            if not worker.aborted:
-                self.log.critical("WORKER TIMEOUT (pid:%s)", pid)
-                worker.aborted = True
-                self.kill_worker(pid, signal.SIGABRT)
-            else:
-                self.kill_worker(pid, signal.SIGKILL)
+            if not worker.termination_deadline:
+                self.log.critical("WORKER TIMEOUT (pid:%s)", worker.pid)
+            self.kill_worker(worker, signal.SIGABRT)
 
     def reap_workers(self):
         """\
@@ -525,11 +522,9 @@ class Arbiter:
         if len(self.WORKERS) < self.num_workers:
             self.spawn_workers()
 
-        workers = self.WORKERS.items()
-        workers = sorted(workers, key=lambda w: w[1].age)
+        workers = list(self.WORKERS.values())
         while len(workers) > self.num_workers:
-            (pid, _) = workers.pop(0)
-            self.kill_worker(pid, signal.SIGTERM)
+            self.kill_worker(workers.pop(0), signal.SIGTERM)
 
         active_worker_count = len(workers)
         if self._last_logged_active_worker_count != active_worker_count:
@@ -602,26 +597,23 @@ class Arbiter:
         Kill all workers with the signal `sig`
         :attr sig: `signal.SIG*` value
         """
-        worker_pids = list(self.WORKERS.keys())
-        for pid in worker_pids:
-            self.kill_worker(pid, sig)
+        for worker in self.WORKERS.values():
+            self.kill_worker(worker, sig)
 
-    def kill_worker(self, pid, sig):
+    def kill_worker(self, worker, sig):
         """\
-        Kill a worker
-
-        :attr pid: int, worker pid
-        :attr sig: `signal.SIG*` value
+        Kill a worker unless it already has been issued a kill
          """
+        if not worker.termination_deadline:
+            worker.termination_deadline = time.monotonic() + self.cfg.graceful_timeout
+            self.send_signal_to_pid(worker.pid, sig)
+        elif sig == signal.SIGKILL or time.monotonic() >= worker.termination_deadline:
+            self.send_signal_to_pid(worker.pid, signal.SIGKILL)
+
+    def send_signal_to_pid(self, pid, sig):
         try:
             os.kill(pid, sig)
+            return True
         except OSError as e:
-            if e.errno == errno.ESRCH:
-                try:
-                    worker = self.WORKERS.pop(pid)
-                    worker.tmp.close()
-                    self.cfg.worker_exit(self, worker)
-                    return
-                except (KeyError, OSError):
-                    return
-            raise
+            self.log.error("Failed sending signal %s to PID %s: %s" % (sig, pid, e))
+            return False
